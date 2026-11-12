@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from api.middlewares.logging_middleware import LoggingMiddleware, RequestIDMiddleware
 from api.routers.v1.workspace_router import router as workspaces_v1_router
 from api.routers.v1.memory_router import router as memory_router
+from api.routers.v1.ingest_router import router as ingest_router
 from configuration.database import init_db
 from configuration.logging_setup import logger
 from configuration.settings import settings
@@ -254,28 +255,6 @@ def create_app() -> FastAPI:
             "injected": True,
         }
 
-    # ── Text extraction (PDF / any text file) for cognify ────────────────────
-    @app.post("/cognify/extract")
-    async def extract_text_for_cognify(file: UploadFile = FastAPIFile(...)):
-        import pathlib
-        raw = await file.read()
-        ext = pathlib.Path(file.filename).suffix.lower()
-        text = ""
-        if ext == ".pdf":
-            try:
-                import pypdf, io
-                reader = pypdf.PdfReader(io.BytesIO(raw))
-                text = "\n\n".join(
-                    page.extract_text() or "" for page in reader.pages
-                ).strip()
-            except Exception as exc:
-                return JSONResponse({"error": f"PDF extraction failed: {exc}"}, status_code=422)
-        else:
-            text = raw.decode("utf-8", errors="replace")
-        if not text.strip():
-            return JSONResponse({"error": "No text content extracted."}, status_code=422)
-        return {"text": text, "filename": file.filename, "chars": len(text)}
-
     # ── Cognify proxy (for UI /add) — calls mcp-wrapper via JSON-RPC ─────────
     @app.post("/add")
     async def add_data(request: Request):
@@ -338,6 +317,7 @@ def create_app() -> FastAPI:
     # ── Routers ───────────────────────────────────────────────────────────────
     app.include_router(workspaces_v1_router, prefix=f"{settings.API_PREFIX}/v1")
     app.include_router(memory_router,        prefix=f"{settings.API_PREFIX}/v1")
+    app.include_router(ingest_router,        prefix=f"{settings.API_PREFIX}/v1")
 
     @app.exception_handler(RequestValidationError)
     async def validation_exception_handler(request: Request, exc: RequestValidationError):

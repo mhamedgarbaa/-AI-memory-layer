@@ -1,18 +1,21 @@
 """
-Interactive agent powered by Groq (llama-4-scout) with Cognee MCP as its memory backend.
+Interactive agent with two backends:
 
-The agent can:
-  - store knowledge into the Cognee graph   → cognify / save_interaction tools
-  - recall knowledge from the graph          → search tool
-  - inspect what's stored                    → list_data tool
-  - wipe all memory                          → prune tool
+  --backend orchestrator  (default)  connects to :8003 — 4 intelligent tools
+                                     save / search / improve / delete
+                                     Auto-classifies documents, detects temporal,
+                                     routes search to the best strategy.
+
+  --backend wrapper                  connects to :8002 — original 18-tool gateway
+                                     (backward-compatible mode)
 
 Run:
-    GROQ_API_KEY=<your-key> python agent_chat.py
-or set GROQ_API_KEY in .env and run:
-    python agent_chat.py
+    python agent_chat.py                           # orchestrator mode
+    python agent_chat.py --backend wrapper         # direct wrapper mode
+    GROQ_API_KEY=<key> python agent_chat.py
 """
 
+import argparse
 import asyncio
 import json
 import os
@@ -25,27 +28,199 @@ from groq import Groq
 
 load_dotenv()
 
-# ── config ────────────────────────────────────────────────────────────────────
-
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-MCP_URL      = os.getenv("MCP_URL", "http://localhost:8002")
+# ── env ───────────────────────────────────────────────────────────────────────
+
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL   = os.getenv("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 AGENT_USER   = os.getenv("AGENT_USER", "chat_user")
 
 MCP_HEADERS = {"Accept": "application/json, text/event-stream"}
 
-SYSTEM_PROMPT = """You are a helpful memory assistant connected to a Cognee knowledge graph via the MCP Wrapper.
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ORCHESTRATOR BACKEND  (:8003) — 4 intelligent tools
+# ══════════════════════════════════════════════════════════════════════════════
+
+ORCHESTRATOR_SYSTEM_PROMPT = """You are an intelligent memory assistant backed by a LangGraph Orchestrator Agent.
+The orchestrator automatically classifies documents, detects temporal content, versions documents,
+and routes queries to the best search strategy — you do not need to specify datasets or search types manually.
+
+You have 4 tools:
+
+WRITE:
+- **save**: Store any document or fact. The orchestrator will:
+    * classify it into the correct dataset (policy, regulation, employees, market, workflow, contracts, reports)
+    * detect dates/events and flag it as temporal
+    * check for existing versions and tag the new one
+    * You can pass a hint (e.g. hint="market") to override classification.
+
+READ:
+- **search**: Query the knowledge graph. The orchestrator will:
+    * analyse your query with an LLM
+    * automatically pick the best search strategy (TEMPORAL, GRAPH_COMPLETION, GRAPH_SUMMARY, CYPHER, etc.)
+    * You can pass hint="temporal", "factual", "summary", or "chunks" to guide routing.
+
+MANAGE:
+- **improve**: Run the quality improvement loop — applies feedback weights, persists sessions, syncs traces.
+  Pass dataset_name="all" (default) or a specific dataset name.
+- **delete**: Remove knowledge. Pass target="all" to wipe everything, a dataset name like "ds_policy",
+  or a UUID to delete a single item. Optional mode="soft" (default) or "hard".
+
+Guidelines:
+- Use **save** when the user shares a fact, document, or information to remember.
+- Use **search** before answering any question — let the orchestrator pick the right search type.
+- Use **improve** when the user asks to refine, reinforce, or improve stored knowledge.
+- Use **delete** only when explicitly asked to remove something.
+- After each tool call, summarize the result in 1-2 sentences.
+- If search returns nothing useful, say so honestly and answer from your own knowledge.
+"""
+
+ORCHESTRATOR_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "save",
+            "description": (
+                "Save a document or fact into the knowledge graph. "
+                "The orchestrator auto-classifies it into the right dataset, "
+                "detects temporal content, and handles versioning automatically. "
+                "Optionally pass hint to override classification (e.g. 'market', 'policy', 'contracts')."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "data": {
+                        "type": "string",
+                        "description": "The full text content to save.",
+                    },
+                    "hint": {
+                        "type": "string",
+                        "description": "Optional dataset type hint: policy | regulation | employees | market | workflow | contracts | reports",
+                    },
+                },
+                "required": ["data"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search",
+            "description": (
+                "Search the knowledge graph with a natural language query. "
+                "The orchestrator analyses the query and automatically picks the best search strategy. "
+                "Optionally pass hint='temporal' for time-based queries, 'summary' for overviews, "
+                "'factual' for specific facts, or 'chunks' for raw text retrieval."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural language question or query.",
+                    },
+                    "hint": {
+                        "type": "string",
+                        "description": "Optional routing hint: temporal | factual | summary | chunks | cypher",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "improve",
+            "description": (
+                "Run the quality improvement loop: applies feedback weights, "
+                "persists sessions into the graph, syncs traces, and rebuilds the session index."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "dataset_name": {
+                        "type": "string",
+                        "description": "Dataset to improve. Default 'all' runs on every dataset.",
+                        "default": "all",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete",
+            "description": (
+                "Delete knowledge from the graph. "
+                "target='all' wipes everything, a dataset name (e.g. 'ds_policy') deletes a full dataset, "
+                "a UUID deletes a single item. Use mode='hard' for permanent deletion."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "'all' | '<dataset_name>' | '<data-uuid>'",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["soft", "hard"],
+                        "default": "soft",
+                    },
+                },
+                "required": ["target"],
+            },
+        },
+    },
+]
+
+
+async def dispatch_orchestrator(mcp: "MCPClient", name: str, args: dict) -> str:
+    if name == "save":
+        return await mcp.call("save", {
+            "data": args["data"],
+            **( {"hint": args["hint"]} if args.get("hint") else {} ),
+        }, timeout=180)
+
+    if name == "search":
+        return await mcp.call("search", {
+            "query": args["query"],
+            **( {"hint": args["hint"]} if args.get("hint") else {} ),
+        }, timeout=120)
+
+    if name == "improve":
+        return await mcp.call("improve", {
+            "dataset_name": args.get("dataset_name", "all"),
+        }, timeout=180)
+
+    if name == "delete":
+        return await mcp.call("delete", {
+            "target": args["target"],
+            "mode":   args.get("mode", "soft"),
+        }, timeout=60)
+
+    return f"Unknown orchestrator tool: {name}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# WRAPPER BACKEND  (:8002) — original 18-tool gateway
+# ══════════════════════════════════════════════════════════════════════════════
+
+WRAPPER_SYSTEM_PROMPT = """You are a helpful memory assistant connected to a Cognee knowledge graph via the MCP Wrapper.
 
 You have access to the following tools:
 
 WRITE:
 - **cognify**: Deep-process text into the graph (entity extraction, relationships). Use for facts, documents, rich content. Takes ~30s.
 - **save_interaction**: Quickly save a short note without full graph processing. Takes ~2s.
-- **memify**: Enrich stored chunks with temporal Event nodes (timestamps). Enables TEMPORAL search. Takes 1-3 minutes.
+- **memify**: Enrich stored chunks with temporal Event nodes (timestamps). Enables TEMPORAL search.
 - **persist_sessions**: Store a conversation transcript as graph nodes for future recall.
 - **improve_answer**: Re-query with chain-of-thought reasoning and store the corrected answer.
 
@@ -56,17 +231,125 @@ READ:
 - **visualize_graph**: Render the full knowledge graph as an interactive HTML file.
 
 ADMIN:
-- **prune**: Wipe ALL stored knowledge. Irreversible — only call when explicitly asked.
+- **prune**: Wipe ALL stored knowledge. Irreversible.
 
 Guidelines:
-- When a user shares information to remember, use `cognify` (rich content) or `save_interaction` (short notes).
-- When a user asks a question, ALWAYS call `search` first before answering.
-- For time-related queries ("what happened last week?"), use search_type=TEMPORAL after running `memify`.
-- Be concise. After using a tool, summarize what you found or did in 1-2 sentences.
-- If search returns nothing useful, say so and answer from your own knowledge.
+- When a user shares information to remember, use cognify (rich) or save_interaction (short).
+- When a user asks a question, ALWAYS call search first before answering.
+- For time-related queries, use search_type=TEMPORAL after running memify.
+- Be concise. Summarize tool results in 1-2 sentences.
 """
 
-# ── MCP client ────────────────────────────────────────────────────────────────
+WRAPPER_TOOLS = [
+    {"type": "function", "function": {
+        "name": "cognify",
+        "description": "Store and deeply process knowledge into the Cognee graph. Set temporal=true when content contains dates/times.",
+        "parameters": {"type": "object", "properties": {
+            "data": {"type": "string"},
+            "temporal": {"type": "boolean", "default": False},
+        }, "required": ["data"]},
+    }},
+    {"type": "function", "function": {
+        "name": "save_interaction",
+        "description": "Quickly save a short note to memory (no deep graph processing).",
+        "parameters": {"type": "object", "properties": {
+            "data": {"type": "string"},
+        }, "required": ["data"]},
+    }},
+    {"type": "function", "function": {
+        "name": "search",
+        "description": "Search the knowledge graph. search_type options: GRAPH_COMPLETION, TEMPORAL, RAG_COMPLETION, CHUNKS, SUMMARIES, CYPHER, GRAPH_COMPLETION_COT.",
+        "parameters": {"type": "object", "properties": {
+            "query":       {"type": "string"},
+            "search_type": {"type": "string", "enum": [
+                "GRAPH_COMPLETION", "GRAPH_COMPLETION_COT", "TEMPORAL",
+                "RAG_COMPLETION", "CHUNKS", "SUMMARIES", "CYPHER",
+            ], "default": "GRAPH_COMPLETION"},
+        }, "required": ["query"]},
+    }},
+    {"type": "function", "function": {
+        "name": "list_data",
+        "description": "List all datasets stored in the graph.",
+        "parameters": {"type": "object", "properties": {}},
+    }},
+    {"type": "function", "function": {
+        "name": "prune",
+        "description": "Wipe ALL stored knowledge. Irreversible.",
+        "parameters": {"type": "object", "properties": {}},
+    }},
+    {"type": "function", "function": {
+        "name": "cognify_status",
+        "description": "Check whether the cognify pipeline is idle or running.",
+        "parameters": {"type": "object", "properties": {}},
+    }},
+    {"type": "function", "function": {
+        "name": "memify",
+        "description": "Enrich graph with temporal Event nodes. Run after cognify.",
+        "parameters": {"type": "object", "properties": {
+            "dataset": {"type": "string"},
+        }},
+    }},
+    {"type": "function", "function": {
+        "name": "visualize_graph",
+        "description": "Render the Neo4j graph as interactive HTML.",
+        "parameters": {"type": "object", "properties": {}},
+    }},
+    {"type": "function", "function": {
+        "name": "persist_sessions",
+        "description": "Store a conversation transcript as knowledge graph nodes.",
+        "parameters": {"type": "object", "properties": {
+            "data": {"type": "string"},
+        }, "required": ["data"]},
+    }},
+    {"type": "function", "function": {
+        "name": "improve_answer",
+        "description": "Re-query with chain-of-thought and store the corrected answer.",
+        "parameters": {"type": "object", "properties": {
+            "question":     {"type": "string"},
+            "wrong_answer": {"type": "string"},
+            "feedback":     {"type": "string"},
+        }, "required": ["question", "wrong_answer", "feedback"]},
+    }},
+]
+
+
+async def dispatch_wrapper(mcp: "MCPClient", name: str, args: dict) -> str:
+    if name == "cognify":
+        call_args: dict = {"data": args["data"]}
+        if args.get("temporal") is True or str(args.get("temporal", "")).lower() == "true":
+            call_args["temporal"] = True
+        return await mcp.call("cognify", call_args, timeout=300)
+    if name == "save_interaction":
+        return await mcp.call("save_interaction", {"data": args["data"]}, timeout=120)
+    if name == "search":
+        return await mcp.call("search", {
+            "search_query": args["query"],
+            "search_type":  args.get("search_type", "GRAPH_COMPLETION"),
+        }, timeout=180)
+    if name == "list_data":
+        return await mcp.call("list_data", {}, timeout=60)
+    if name == "prune":
+        return await mcp.call("prune", {}, timeout=60)
+    if name == "cognify_status":
+        return await mcp.call("cognify_status", {}, timeout=30)
+    if name == "memify":
+        return await mcp.call("memify", {"dataset": args.get("dataset", "main_dataset")}, timeout=300)
+    if name == "visualize_graph":
+        return await mcp.call("visualize_graph", {}, timeout=60)
+    if name == "persist_sessions":
+        return await mcp.call("persist_sessions", {"data": args["data"]}, timeout=120)
+    if name == "improve_answer":
+        return await mcp.call("improve_answer", {
+            "question":     args["question"],
+            "wrong_answer": args["wrong_answer"],
+            "feedback":     args["feedback"],
+        }, timeout=120)
+    return f"Unknown wrapper tool: {name}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MCP CLIENT (shared)
+# ══════════════════════════════════════════════════════════════════════════════
 
 class MCPClient:
     def __init__(self, client: httpx.AsyncClient):
@@ -93,7 +376,7 @@ class MCPClient:
                 "params": {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {},
-                    "clientInfo": {"name": "agent-chat", "version": "1.0"},
+                    "clientInfo": {"name": "agent-chat", "version": "2.0"},
                 },
             },
             headers=MCP_HEADERS,
@@ -127,265 +410,141 @@ class MCPClient:
         return "\n".join(parts) if parts else json.dumps(data.get("result", {}))
 
 
-# ── tool definitions (passed to Groq) ─────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# AGENTIC CHAT LOOP
+# ══════════════════════════════════════════════════════════════════════════════
 
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "cognify",
-            "description": "Store and deeply process knowledge into the Cognee graph (entity extraction, relationship mapping). Use for facts, documents, or multi-sentence content worth remembering long-term. Set temporal=true when the content contains dates/times and you want TEMPORAL search to work on it.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "data": {"type": "string", "description": "The content to store and process."},
-                },
-                "required": ["data"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "save_interaction",
-            "description": "Quickly save a short user note or interaction to memory (lighter than cognify, no deep graph processing).",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "data": {"type": "string", "description": "The note or interaction to save."},
-                },
-                "required": ["data"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search",
-            "description": (
-                "Search the knowledge graph. Choose search_type based on the question:\n"
-                "- GRAPH_COMPLETION (default): entity graph traversal + LLM synthesis\n"
-                "- TEMPORAL: time-aware, filters Event nodes by timestamp (use for 'when' questions)\n"
-                "- RAG_COMPLETION: classic vector RAG over document chunks\n"
-                "- CHUNKS: raw text chunk retrieval\n"
-                "- SUMMARIES: retrieve document summaries only\n"
-                "- CYPHER: LLM generates a Cypher query for structured graph questions\n"
-                "- GRAPH_COMPLETION_COT: chain-of-thought multi-round reasoning (complex questions)"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Natural-language search query."},
-                    "search_type": {
-                        "type": "string",
-                        "enum": [
-                            "GRAPH_COMPLETION", "GRAPH_COMPLETION_COT", "TEMPORAL",
-                            "RAG_COMPLETION", "CHUNKS", "SUMMARIES", "CYPHER",
-                        ],
-                        "default": "GRAPH_COMPLETION",
-                    },
-                },
-                "required": ["query"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_data",
-            "description": "List all datasets currently stored in the Cognee graph.",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "prune",
-            "description": "Wipe ALL stored knowledge from the graph. Irreversible — only call when the user explicitly asks to clear memory.",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "cognify_status",
-            "description": "Check whether the cognify background pipeline is idle or still running.",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "memify",
-            "description": "Enrich an existing knowledge graph by creating triplet embeddings (Entity → Relationship → Entity). Enables SearchType.TRIPLET_COMPLETION queries. Run after cognify on a dataset. Takes 5-10 minutes.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "dataset": {"type": "string", "description": "Dataset name to enrich (default: main_dataset)."},
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "visualize_graph",
-            "description": "Render the full Neo4j knowledge graph as an interactive HTML file. Call when the user asks to see or explore the graph visually.",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "persist_sessions",
-            "description": "Store a conversation transcript as knowledge graph nodes so it can be recalled in future sessions.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "data": {"type": "string", "description": "Conversation transcript to persist."},
-                },
-                "required": ["data"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "improve_answer",
-            "description": "Re-query the graph with chain-of-thought reasoning and store the corrected answer. Use when a previous answer was wrong.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "question":     {"type": "string", "description": "The original question."},
-                    "wrong_answer": {"type": "string", "description": "The incorrect answer that was given."},
-                    "feedback":     {"type": "string", "description": "What was wrong and what the correct answer should be."},
-                },
-                "required": ["question", "wrong_answer", "feedback"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "graphiti_ingest",
-            "description": "Ingest documents into the Graphiti temporal episode graph to track how facts evolve over time. Each text becomes a timestamped episode in Neo4j. Use for documents where content changes across versions.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "texts": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "List of texts/documents to ingest as timestamped episodes.",
-                    },
-                },
-                "required": ["texts"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "graphiti_search",
-            "description": "Search the Graphiti temporal episode graph for how facts evolved over time. Best for: 'how did X change?', 'what was the status of Y in period Z?', 'what changed between documents?'",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Natural language query about fact evolution over time."},
-                },
-                "required": ["query"],
-            },
-        },
-    },
-]
+SLASH_HELP = """
+Slash commands:
+  /save <text>          Save text via the save tool
+  /search <query>       Search the graph
+  /search:temporal <q>  Search with temporal hint
+  /search:summary <q>   Search with summary hint
+  /delete <target>      Delete all | <dataset> | <uuid>
+  /improve              Run improve loop
+  /help                 Show this help
+  /quit                 Exit
+"""
 
 
-# ── tool dispatcher ────────────────────────────────────────────────────────────
-
-async def dispatch(mcp: MCPClient, name: str, args: dict) -> str:
-    print(f"\n  [tool: {name}] args={json.dumps(args, ensure_ascii=False)[:120]}")
-    try:
-        if name == "cognify":
-            cognify_args = {"data": args["data"]}
-            temporal = args.get("temporal")
-            if temporal is True or str(temporal).lower() == "true":
-                cognify_args["temporal"] = True
-            result = await mcp.call("cognify", cognify_args, timeout=300)
-        elif name == "save_interaction":
-            result = await mcp.call("save_interaction", {"data": args["data"]}, timeout=120)
-        elif name == "search":
-            result = await mcp.call(
-                "search",
-                {
-                    "search_query": args["query"],
-                    "search_type": args.get("search_type", "GRAPH_COMPLETION"),
-                },
-                timeout=180,
-            )
-        elif name == "list_data":
-            result = await mcp.call("list_data", {}, timeout=60)
-        elif name == "prune":
-            result = await mcp.call("prune", {}, timeout=60)
-        elif name == "cognify_status":
-            result = await mcp.call("cognify_status", {}, timeout=30)
-        elif name == "memify":
-            result = await mcp.call("memify", {"dataset": args.get("dataset", "main_dataset")}, timeout=300)
-        elif name == "visualize_graph":
-            result = await mcp.call("visualize_graph", {}, timeout=60)
-        elif name == "persist_sessions":
-            result = await mcp.call("persist_sessions", {"data": args["data"]}, timeout=120)
-        elif name == "improve_answer":
-            result = await mcp.call("improve_answer", {
-                "question":     args["question"],
-                "wrong_answer": args["wrong_answer"],
-                "feedback":     args["feedback"],
-            }, timeout=120)
-        elif name == "graphiti_ingest":
-            result = await mcp.call("graphiti_ingest", {"texts": args["texts"]}, timeout=300)
-        elif name == "graphiti_search":
-            result = await mcp.call("graphiti_search", {"query": args["query"]}, timeout=120)
-        else:
-            result = f"Unknown tool: {name}"
-        print(f"  [tool: {name}] done — {result[:120].replace(chr(10), ' ')}")
-        return result
-    except Exception as exc:
-        err = f"Tool {name} failed: {exc}"
-        print(f"  [tool: {name}] ERROR — {exc}")
-        return err
-
-
-# ── agentic loop ──────────────────────────────────────────────────────────────
-
-async def chat_loop(mcp: MCPClient) -> None:
+async def chat_loop(mcp: MCPClient, backend: str) -> None:
     groq = Groq(api_key=GROQ_API_KEY)
+
+    if backend == "orchestrator":
+        tools         = ORCHESTRATOR_TOOLS
+        system_prompt = ORCHESTRATOR_SYSTEM_PROMPT
+        dispatch_fn   = dispatch_orchestrator
+        tool_names    = "save / search / improve / delete"
+    else:
+        tools         = WRAPPER_TOOLS
+        system_prompt = WRAPPER_SYSTEM_PROMPT
+        dispatch_fn   = dispatch_wrapper
+        tool_names    = "cognify / search / save_interaction / list_data / prune + more"
+
     history: list[dict] = []
 
-    print("\n" + "═" * 60)
-    print("  Cognee Memory Agent  (model: llama-4-scout)")
-    print("  MCP Wrapper:", MCP_URL, " | tools: 10")
-    print("  Type 'quit' or Ctrl-C to exit.")
-    print("═" * 60 + "\n")
+    print("\n" + "=" * 62)
+    print(f"  Orchestrator Memory Agent  (backend: {backend})")
+    print(f"  Endpoint : {mcp._http.base_url}")
+    print(f"  Model    : {GROQ_MODEL}")
+    print(f"  Tools    : {tool_names}")
+    print(f"  Session  : {mcp.session_id[:24]}...")
+    print("  Type /help for slash commands or just chat naturally.")
+    print("=" * 62 + "\n")
 
     while True:
         try:
-            user_input = input("You: ").strip()
+            raw = input("You: ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\nBye.")
             break
 
-        if not user_input:
+        if not raw:
             continue
-        if user_input.lower() in {"quit", "exit", "bye"}:
-            print("Bye.")
-            break
 
-        history.append({"role": "user", "content": user_input})
+        # ── Slash commands ─────────────────────────────────────────────────
+        if raw.startswith("/"):
+            cmd, _, rest = raw.partition(" ")
+            cmd = cmd.lower()
 
-        # agentic tool-use loop — keep calling until the model stops requesting tools
+            if cmd in ("/quit", "/exit", "/bye"):
+                print("Bye.")
+                break
+
+            if cmd == "/help":
+                print(SLASH_HELP)
+                continue
+
+            if cmd == "/save" and rest:
+                print(f"\n  [save] saving...")
+                try:
+                    result = await mcp.call("save", {"data": rest}, timeout=180) \
+                        if backend == "orchestrator" else \
+                        await mcp.call("cognify", {"data": rest}, timeout=300)
+                    print(f"  [save] {result[:200]}\n")
+                except Exception as exc:
+                    print(f"  [save] ERROR: {exc}\n")
+                continue
+
+            if cmd.startswith("/search"):
+                hint = ""
+                if ":" in cmd:
+                    hint = cmd.split(":", 1)[1]
+                query = rest or "summarize stored knowledge"
+                print(f"\n  [search] querying (hint={hint or 'auto'})...")
+                try:
+                    if backend == "orchestrator":
+                        call_args: dict = {"query": query}
+                        if hint:
+                            call_args["hint"] = hint
+                        result = await mcp.call("search", call_args, timeout=120)
+                    else:
+                        stype_map = {"temporal": "TEMPORAL", "summary": "GRAPH_SUMMARY_COMPLETION", "chunks": "CHUNKS"}
+                        result = await mcp.call("search", {
+                            "search_query": query,
+                            "search_type":  stype_map.get(hint, "GRAPH_COMPLETION"),
+                        }, timeout=180)
+                    print(f"  [search] {result[:400]}\n")
+                except Exception as exc:
+                    print(f"  [search] ERROR: {exc}\n")
+                continue
+
+            if cmd == "/improve":
+                print(f"\n  [improve] running...")
+                try:
+                    result = await mcp.call("improve", {"dataset_name": rest or "all"}, timeout=180) \
+                        if backend == "orchestrator" else \
+                        await mcp.call("improve", {}, timeout=180)
+                    print(f"  [improve] {result[:200]}\n")
+                except Exception as exc:
+                    print(f"  [improve] ERROR: {exc}\n")
+                continue
+
+            if cmd == "/delete" and rest:
+                confirm = input(f"  Delete '{rest}'? (yes/no): ").strip().lower()
+                if confirm == "yes":
+                    try:
+                        result = await mcp.call("delete", {"target": rest}, timeout=60) \
+                            if backend == "orchestrator" else \
+                            await mcp.call("prune", {}, timeout=60)
+                        print(f"  [delete] {result[:200]}\n")
+                    except Exception as exc:
+                        print(f"  [delete] ERROR: {exc}\n")
+                else:
+                    print("  Cancelled.\n")
+                continue
+
+            print(f"  Unknown command '{cmd}'. Type /help.\n")
+            continue
+
+        # ── Natural language agentic loop ──────────────────────────────────
+        history.append({"role": "user", "content": raw})
+
         while True:
             response = groq.chat.completions.create(
                 model=GROQ_MODEL,
-                messages=[{"role": "system", "content": SYSTEM_PROMPT}] + history,
-                tools=TOOLS,
+                messages=[{"role": "system", "content": system_prompt}] + history,
+                tools=tools,
                 tool_choice="auto",
                 temperature=0.3,
                 max_tokens=2048,
@@ -394,7 +553,6 @@ async def chat_loop(mcp: MCPClient) -> None:
             msg = response.choices[0].message
 
             if msg.tool_calls:
-                # Add assistant message with tool_calls to history
                 history.append({
                     "role": "assistant",
                     "content": msg.content or "",
@@ -408,41 +566,60 @@ async def chat_loop(mcp: MCPClient) -> None:
                     ],
                 })
 
-                # Execute each requested tool
                 for tc in msg.tool_calls:
                     try:
                         args = json.loads(tc.function.arguments)
                     except json.JSONDecodeError:
                         args = {}
-                    result = await dispatch(mcp, tc.function.name, args)
+
+                    print(f"\n  [tool: {tc.function.name}] {json.dumps(args, ensure_ascii=False)[:100]}")
+                    try:
+                        result = await dispatch_fn(mcp, tc.function.name, args)
+                        print(f"  [tool: {tc.function.name}] {result[:140].replace(chr(10), ' ')}")
+                    except Exception as exc:
+                        result = f"Tool error: {exc}"
+                        print(f"  [tool: {tc.function.name}] ERROR: {exc}")
+
                     history.append({
                         "role": "tool",
                         "tool_call_id": tc.id,
                         "content": result,
                     })
-                # loop back — let the model process tool results
                 continue
 
-            # No more tool calls — final answer
             answer = msg.content or "(no response)"
             history.append({"role": "assistant", "content": answer})
             print(f"\nAgent: {answer}\n")
             break
 
 
-# ── entrypoint ────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# ENTRYPOINT
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def main() -> None:
+    parser = argparse.ArgumentParser(description="Cognee memory agent chat")
+    parser.add_argument(
+        "--backend",
+        choices=["orchestrator", "wrapper"],
+        default="orchestrator",
+        help="orchestrator=:8003 (4-tool, default)  wrapper=:8002 (18-tool)",
+    )
+    parser.add_argument("--url", default=None, help="Override MCP URL")
+    args = parser.parse_args()
+
     if not GROQ_API_KEY:
-        print("ERROR: set GROQ_API_KEY environment variable.")
+        print("ERROR: set GROQ_API_KEY in .env or environment.")
         sys.exit(1)
 
-    async with httpx.AsyncClient(base_url=MCP_URL) as http:
+    default_ports = {"orchestrator": "http://localhost:8003", "wrapper": "http://localhost:8002"}
+    mcp_url = args.url or os.getenv("MCP_URL", default_ports[args.backend])
+
+    async with httpx.AsyncClient(base_url=mcp_url, timeout=30) as http:
         mcp = MCPClient(http)
-        print(f"Connecting to MCP at {MCP_URL} ...")
+        print(f"Connecting to {args.backend} at {mcp_url} ...")
         await mcp.connect()
-        print(f"MCP session: {mcp.session_id}")
-        await chat_loop(mcp)
+        await chat_loop(mcp, args.backend)
 
 
 if __name__ == "__main__":

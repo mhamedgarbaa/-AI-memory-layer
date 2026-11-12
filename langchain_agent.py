@@ -29,15 +29,15 @@ warnings.filterwarnings("ignore", category=DeprecationWarning, module="langgraph
 load_dotenv()
 
 # ─── Config ───────────────────────────────────────────────────────────────────
-MCP_URL      = os.getenv("MCP_URL",       "http://localhost:8002/mcp")
+MCP_URL      = os.getenv("ORCHESTRATOR_URL", "http://localhost:8003") + "/mcp"
 GROQ_API_KEY = os.getenv("GROQ_API_KEY",  "")
 GROQ_MODEL   = os.getenv("GROQ_MODEL",    "meta-llama/llama-4-scout-17b-16e-instruct")
 USER_ID      = os.getenv("AGENT_USER_ID", "ceo")
 
-SKIP_TRACE = {"record_trace", "submit_feedback"}
+SKIP_TRACE: set = set()  # orchestrator has no trace tool
 
 SYSTEM_PROMPT = f"""You are the Enterprise Brain — temporal knowledge assistant for CEO/Admin use.
-You are connected to a Cognee knowledge graph via MCP tools.
+You are connected to a Cognee knowledge graph via the Orchestrator (4 tools).
 Today: {datetime.now().strftime("%Y-%m-%d")}  |  User: {USER_ID}
 
 ## MANDATORY RULES
@@ -45,33 +45,24 @@ Today: {datetime.now().strftime("%Y-%m-%d")}  |  User: {USER_ID}
 1. **Search before answering** — Always call `search` before answering any factual question.
    Never answer from your own training knowledge alone.
 
-2. **Store important information** — When the user shares facts, decisions, or observations:
-   - `cognify`           → full graph processing, use for anything significant
-   - `save_interaction`  → fast short note, use for quick reminders
+2. **Store important information** — When the user shares facts, decisions, or context:
+   call `save`. The orchestrator auto-classifies the content into the correct typed dataset
+   (policy, regulation, employees, market, workflow, contracts, reports).
+   Use `hint` to override: save(data="...", hint="market").
 
-3. **Accept feedback** — When the user rates or corrects an answer call `submit_feedback`
-   with feedback_score (1 = wrong, 5 = perfect).
+3. **Improve** — At the end of a session call `improve` to consolidate learnings into the graph.
 
-4. **Improve** — After feedback or at end of session call `improve` to consolidate
-   session learnings into the permanent graph.
+4. **Be concise** — 2–3 sentences. State whether the answer came from memory or your own knowledge.
 
-5. **Be concise** — 2–3 sentences. State whether the answer came from memory or your own knowledge.
+## TOOL GUIDE
 
-## TOOL SELECTION GUIDE
-
-| Intent | Tool | search_type |
-|--------|------|-------------|
-| Answer any factual question | `search` | GRAPH_COMPLETION |
-| Time-sensitive query | `search` | TEMPORAL |
-| Deep reasoning | `search` | GRAPH_COMPLETION_COT |
-| Store a fact or decision | `cognify` | — |
-| Quick short note | `save_interaction` | — |
-| Extract event timeline | `memify` | — |
-| Consolidate session learnings | `improve` | — |
-| List stored datasets | `list_data` | — |
-| Delete wrong info | `forget_memory` | — |
-| Rate a previous answer | `submit_feedback` | — |
-| Correct a specific wrong answer | `improve_answer` | — |
+| Intent | Tool | Notes |
+|--------|------|-------|
+| Answer any factual question | `search` | auto-routes to best search strategy |
+| Time-sensitive / "when" query | `search` | hint="temporal" to force TEMPORAL search |
+| Store a document or fact | `save` | auto-classified; use hint= to override dataset |
+| Consolidate session learnings | `improve` | run at end of session or after corrections |
+| Remove wrong or outdated info | `delete` | target= "all" / dataset name / item UUID |
 """
 
 
@@ -114,14 +105,14 @@ class CogneeObservabilityCallback(AsyncCallbackHandler):
         self._pending: dict[str, dict] = {}
 
     async def on_tool_start(
-        self, serialized: dict, input_str: str, *, run_id, **kwargs
+        self, serialized: dict, input_str: str, *, run_id, **_kwargs
     ) -> None:
         self._pending[str(run_id)] = {
             "tool":  serialized.get("name", "unknown"),
             "input": str(input_str)[:500],
         }
 
-    async def on_tool_end(self, output: str, *, run_id, **kwargs) -> None:
+    async def on_tool_end(self, _output: str, *, run_id, **_kwargs) -> None:
         info      = self._pending.pop(str(run_id), {})
         tool_name = info.get("tool", "unknown")
         if tool_name in SKIP_TRACE:
@@ -135,7 +126,7 @@ class CogneeObservabilityCallback(AsyncCallbackHandler):
             "error_message":   "",
         }))
 
-    async def on_tool_error(self, error: BaseException, *, run_id, **kwargs) -> None:
+    async def on_tool_error(self, error: BaseException, *, run_id, **_kwargs) -> None:
         info      = self._pending.pop(str(run_id), {})
         tool_name = info.get("tool", "unknown")
         if tool_name in SKIP_TRACE:
@@ -163,8 +154,11 @@ async def main() -> None:
     mcp_client = MultiServerMCPClient({
         "cognee": {"url": MCP_URL, "transport": "streamable_http"},
     })
-    tools = await mcp_client.get_tools()
-    print(f"[cognee] {len(tools)} tools: {[t.name for t in tools]}")
+    # Orchestrator exposes exactly 4 tools — use all of them
+    AGENT_TOOLS = {"save", "search", "improve", "delete"}
+    all_tools = await mcp_client.get_tools()
+    tools = [t for t in all_tools if t.name in AGENT_TOOLS]
+    print(f"[orchestrator] {len(tools)} tools: {[t.name for t in tools]}")
 
     # Dedicated HTTP client for background trace + visualize calls
     base_url = MCP_URL.rsplit("/mcp", 1)[0]
@@ -221,15 +215,11 @@ async def main() -> None:
                 print()
 
     finally:
-        # Promote session learnings into the permanent graph before exit
-        print("[cognee] Running improve loop...")
-        await _bg_call(http, bg_session_id, "improve", {
-            "dataset_name": f"{USER_ID}_session",
-            "session_ids":  [bg_session_id],
-        })
+        print("[orchestrator] Running improve loop...")
+        await _bg_call(http, bg_session_id, "improve", {})
         await asyncio.sleep(2)
         await http.aclose()
-        print("[cognee] Session closed.")
+        print("[orchestrator] Session closed.")
 
 
 if __name__ == "__main__":

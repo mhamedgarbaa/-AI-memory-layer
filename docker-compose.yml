@@ -267,6 +267,7 @@ services:
       # Cognee MCP (internal Docker DNS)
       MCP_SERVER_URL: "http://cognee-mcp:8000"
       MCP_WRAPPER_URL: "http://mcp-wrapper:8002"
+      ORCHESTRATOR_URL: "http://orchestrator:8003"
       MCP_PROTOCOL: "http"
       MCP_HOST_HEADER: "localhost:8001"
       MCP_TIMEOUT: "300"
@@ -276,14 +277,53 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
       - ./:/app
+      - /app/.venv          # shadow Windows .venv — never scanned by uvicorn
       - graph_output:/graph
     command: >
-      sh -c "chmod -f 777 /graph || true && uvicorn app:app --host 0.0.0.0 --port 8000 --reload"
+      sh -c "chmod -f 777 /graph || true && uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+             --reload-dir /app/api
+             --reload-dir /app/service
+             --reload-dir /app/data
+             --reload-dir /app/configuration
+             --reload-dir /app/orchestrator
+             --reload-dir /app/core"
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 30s
+
+  # ============================================
+  # Orchestrator Agent — 4-tool intelligent gateway
+  # Sits in front of mcp-wrapper; exposes save/search/improve/delete
+  # with automatic classification, versioning, and memory routing.
+  # ============================================
+  orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile.orchestrator
+    container_name: orchestrator_agent
+    restart: unless-stopped
+    ports:
+      - "8003:8003"
+    networks:
+      - cognee_net
+    depends_on:
+      mcp-wrapper:
+        condition: service_healthy
+    environment:
+      MCP_WRAPPER_URL: "http://mcp-wrapper:8002"
+      LLM_API_KEY: "${LLM_API_KEY}"
+      LLM_MODEL: "${LLM_MODEL:-gpt-4o-mini}"
+      LLM_ENDPOINT: "${LLM_ENDPOINT}"
+      ORCHESTRATOR_SESSION_TTL: "${ORCHESTRATOR_SESSION_TTL:-3600}"
+      ORCHESTRATOR_LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8003/health')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
       start_period: 30s
 
 volumes:

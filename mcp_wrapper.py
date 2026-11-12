@@ -722,6 +722,84 @@ async def stream_tool_result(tool_name: str, tool_args: dict, req_id, session_id
 
 # ── custom tool implementations ────────────────────────────────────────────────
 
+_COGNIFY_DATASET_SCRIPT = r"""
+import asyncio, json, sys, os, logging
+
+# Show INFO+ pipeline logs in mcp-wrapper background thread output
+logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="[cognee] %(levelname)s %(name)s: %(message)s")
+os.environ.setdefault("COGNEE_LOG_LEVEL", "INFO")
+
+async def main():
+    args = json.loads(sys.stdin.buffer.read())
+    data         = args["data"]
+    dataset_name = args.get("dataset_name", "main_dataset")
+    temporal     = args.get("temporal", False)
+
+    import cognee
+    await cognee.run_migrations()
+    await cognee.add(data, dataset_name=dataset_name)
+    await cognee.cognify(
+        datasets=[dataset_name],
+        temporal_cognify=temporal,
+        run_in_background=False,
+    )
+    sys.stdout.write(json.dumps({"status": "ok", "dataset": dataset_name}) + "\n")
+    sys.stdout.flush()
+
+asyncio.run(main())
+"""
+
+
+async def _run_cognify_dataset(data: str, dataset_name: str, temporal: bool = False) -> str:
+    """Cognify directly into a named dataset using Cognee's Python API inside the container.
+
+    Bypasses cognee-mcp's MCP tool (which has no dataset_name param) and calls
+    cognee.add() + cognee.cognify(datasets=[...]) directly — same pattern as run_memify.
+    """
+    loop    = asyncio.get_event_loop()
+    payload = json.dumps({"data": data, "dataset_name": dataset_name, "temporal": temporal})
+
+    def _exec() -> str:
+        import docker as _docker, tarfile as _tar, io as _io
+        client    = _docker.from_env()
+        container = client.containers.get(COGNEE_CONTAINER_NAME)
+
+        # Embed the JSON payload directly into a loader preamble so stdin isn't needed
+        loader = (
+            "import sys\n"
+            f"sys.stdin = __import__('io').TextIOWrapper("
+            f"__import__('io').BytesIO({repr(payload.encode())}))\n"
+        ) + _COGNIFY_DATASET_SCRIPT
+
+        buf = _io.BytesIO()
+        with _tar.open(fileobj=buf, mode="w") as t:
+            content = loader.encode()
+            info = _tar.TarInfo(name="cognify_dataset_run.py")
+            info.size = len(content)
+            t.addfile(info, _io.BytesIO(content))
+        buf.seek(0)
+        container.put_archive("/tmp", buf.read())
+
+        exit_code, output = container.exec_run(
+            "python3 /tmp/cognify_dataset_run.py",
+            stream=False, demux=False,
+            environment={"COGNEE_LOG_LEVEL": "INFO"},
+        )
+        text = output.decode(errors="replace").strip() if output else ""
+        if exit_code != 0:
+            log.error("cognify_dataset failed (exit %d): %s", exit_code, text[-400:])
+            raise RuntimeError(f"Dataset cognify failed: {text[-300:]}")
+        # Pick the last JSON line (cognee startup logs appear before it on stdout)
+        for line in reversed(text.splitlines()):
+            if line.strip().startswith("{"):
+                return line.strip()
+        return text[-300:] or f"Cognified into {dataset_name}"
+
+    result = await loop.run_in_executor(None, _exec)
+    log.info("cognify_dataset ok", extra={"dataset": dataset_name, "tool": "cognify"})
+    return result
+
+
 async def run_memify(dataset: str = "main_dataset") -> str:
     """Run memify inside the cognee container via the Python docker SDK."""
     loop = asyncio.get_event_loop()
@@ -1039,6 +1117,73 @@ asyncio.run(main())
     return await loop.run_in_executor(None, _exec)
 
 
+# ── background cognify (plain thread, survives request scope) ──────────────────
+
+_bg_executor = __import__("concurrent.futures", fromlist=["ThreadPoolExecutor"]).ThreadPoolExecutor(
+    max_workers=4, thread_name_prefix="cognify-bg"
+)
+
+
+def _cognify_bg_thread(payload: str) -> None:
+    """Blocking worker: runs inside a plain OS thread, independent of asyncio/anyio."""
+    import tarfile as _tar, io as _io
+    import docker as _docker  # type: ignore[import]
+
+    meta = json.loads(payload)
+    ds   = meta.get("dataset_name", "?")
+
+    try:
+        client    = _docker.from_env()
+        container = client.containers.get(COGNEE_CONTAINER_NAME)
+
+        loader = (
+            "import sys\n"
+            f"sys.stdin = __import__('io').TextIOWrapper("
+            f"__import__('io').BytesIO({repr(payload.encode())}))\n"
+        ) + _COGNIFY_DATASET_SCRIPT
+
+        buf = _io.BytesIO()
+        with _tar.open(fileobj=buf, mode="w") as t:
+            content = loader.encode()
+            info = _tar.TarInfo(name="cognify_dataset_run.py")
+            info.size = len(content)
+            t.addfile(info, _io.BytesIO(content))
+        buf.seek(0)
+        container.put_archive("/tmp", buf.read())
+
+        exit_code, output = container.exec_run(
+            "python3 /tmp/cognify_dataset_run.py",
+            stream=False, demux=False,
+            environment={"COGNEE_LOG_LEVEL": "INFO"},
+        )
+        text = output.decode(errors="replace").strip() if output else ""
+        if exit_code != 0:
+            log.error(
+                "background cognify failed (exit %d) dataset=%s: %s",
+                exit_code, ds, text[-300:],
+                extra={"tool": "cognify", "session_id": ""},
+            )
+        else:
+            log.info(
+                "background cognify done dataset=%s",
+                ds,
+                extra={"tool": "cognify", "session_id": ""},
+            )
+    except Exception as exc:
+        log.error(
+            "background cognify error dataset=%s: %s",
+            ds, exc,
+            extra={"tool": "cognify", "session_id": ""},
+            exc_info=True,
+        )
+
+
+def _fire_cognify_bg(data: str, dataset_name: str, temporal: bool) -> None:
+    """Submit cognify to a plain thread pool — lives outside asyncio/anyio scope."""
+    payload = json.dumps({"data": data, "dataset_name": dataset_name, "temporal": temporal})
+    _bg_executor.submit(_cognify_bg_thread, payload)
+
+
 # ── tool dispatcher ────────────────────────────────────────────────────────────
 
 async def dispatch(tool: str, args: dict, session_id: str = "", user: str = AGENT_USER, dataset: str = "main_dataset") -> str:
@@ -1049,31 +1194,48 @@ async def dispatch(tool: str, args: dict, session_id: str = "", user: str = AGEN
 
     try:
         if tool == "cognify":
-            cognify_args: dict = {
-                "data": args["data"],
-                "temporal_cognify": args.get("temporal", False),
-            }
-            if dataset != "main_dataset":
-                cognify_args["dataset_name"] = dataset
-            result = await cognee_call("cognify", cognify_args, timeout=300)
+            # Caller can pass dataset_name directly in args (orchestrator path) or
+            # rely on the session's active dataset (switch_dataset path).
+            effective_dataset = args.get("dataset_name", "").strip() or dataset
+            if effective_dataset and effective_dataset != "main_dataset":
+                # cognee-mcp's MCP tool has no dataset_name param — bypass it
+                # and call cognee.add() + cognee.cognify() directly via docker exec.
+                # Fire in background so the caller gets an immediate acknowledgement;
+                # the heavy docker-exec pipeline (2-7 min) runs independently.
+                _fire_cognify_bg(
+                    args["data"], effective_dataset,
+                    temporal=args.get("temporal", False),
+                )
+                result = json.dumps({
+                    "status": "processing",
+                    "dataset": effective_dataset,
+                    "message": "Cognify started in background. Use cognify_status to check progress.",
+                })
+            else:
+                result = await cognee_call("cognify", {
+                    "data": args["data"],
+                    "temporal_cognify": args.get("temporal", False),
+                }, timeout=300)
         elif tool == "save_interaction":
-            # Cognee's save_interaction has a bug: it creates a TextDocument with a file
-            # path but never writes the file before the pipeline reads it. Routing to
-            # cognify uses the working code path with the same interface.
-            save_args: dict = {"data": args["data"]}
-            if dataset != "main_dataset":
-                save_args["dataset_name"] = dataset
-            result = await cognee_call("cognify", save_args, timeout=300)
+            effective_dataset = args.get("dataset_name", "").strip() or dataset
+            if effective_dataset and effective_dataset != "main_dataset":
+                result = await _run_cognify_dataset(
+                    args["data"], effective_dataset,
+                    temporal=False,
+                )
+            else:
+                result = await cognee_call("cognify", {"data": args["data"]}, timeout=300)
         elif tool == "search":
             query = args.get("search_query") or args.get("query", "")
             if not query:
                 return [{"type": "text", "text": "Error: search_query is required"}]
+            effective_dataset = args.get("dataset_name", "").strip() or dataset
             search_args: dict = {
                 "search_query": query,
                 "search_type":  args.get("search_type", "GRAPH_COMPLETION"),
             }
-            if dataset != "main_dataset":
-                search_args["dataset_name"] = dataset
+            if effective_dataset and effective_dataset != "main_dataset":
+                search_args["dataset_name"] = effective_dataset
             result = await cognee_call("search", search_args, timeout=180)
         elif tool == "forget_memory":
             forget_args: dict = {}
